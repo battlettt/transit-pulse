@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import sys
+import warnings
 
 import duckdb
 
 from . import __version__
 from .analysis import Thresholds, compute_metrics, infer_service_date
 from .gtfs_static import GTFSError, agency_timezone, build_scheduled_events, load_gtfs
-from .realtime import RealtimeError, load_observation_files
+from .realtime import RealtimeError, UnknownRelationshipWarning, load_observation_files
 from .report import write_events_csv, write_report
 
 
@@ -59,7 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
 def run_analyze(args) -> int:
     con = duckdb.connect()
     load_gtfs(con, args.static)
-    load_observation_files(con, args.realtime)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UnknownRelationshipWarning)
+        load_observation_files(con, args.realtime)
+    for message in sorted({str(w.message) for w in caught
+                           if issubclass(w.category, UnknownRelationshipWarning)}):
+        print(f"warning: {message}", file=sys.stderr)
     service_date = args.date or infer_service_date(con, agency_timezone(con))
     if service_date is None:
         print("error: no observations to infer a service date from; pass --date",
@@ -82,7 +88,8 @@ def run_analyze(args) -> int:
     otp = "n/a" if o["otp_pct"] is None else f"{o['otp_pct']:.1f}%"
     print(f"service date {service_date}: OTP {otp} over {o['observed_events']} observed "
           f"of {o['scheduled_events']} scheduled stop events; "
-          f"{o['cancelled_trips']} cancelled trips; {o['added_trips']} added trips; "
+          f"{o['cancelled_trips']} cancelled trips; {o['replaced_trips']} replaced trips; "
+          f"{o['added_trips']} added trips; "
           f"{o['bunching_events']} bunching events")
     print(f"wrote {json_path}")
     print(f"wrote {html_path}")

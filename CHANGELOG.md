@@ -4,6 +4,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0 - 2026-10-27
+
+### Fixed
+- A GTFS-Realtime trip with `schedule_relationship` `REPLACEMENT`, `DUPLICATED` or `NEW`
+  no longer aborts the run with `unknown schedule_relationship` (exit 2). This bug had
+  existed since 0.1.0.
+  - `REPLACEMENT` trips are matched to the scheduled trip with the same `trip_id` (and
+    `start_time`) and scored like `SCHEDULED` ones. The scheduled trip is counted in the
+    new `replaced_trips` metric.
+  - `DUPLICATED` and `NEW` trips go to the `added_trips` accounting and are never
+    matched to a scheduled trip. A `DUPLICATED` trip uses `trip_properties.trip_id` /
+    `start_date` / `start_time` when they are present. Their `SKIPPED` stop updates are
+    ignored, so a copy cannot mark the original trip's stops as skipped.
+- Observation loading is about 200× faster: 16,530 rows took 17.69 s and now take
+  0.08 s. `load_observations` inserted rows one at a time with `executemany` and now
+  bulk-loads through a temporary CSV. Found during the real-feed validation. Results are
+  unchanged (byte-identical `metrics.json`).
+
+### Changed
+- **Behaviour change:** an unknown `schedule_relationship` value (JSON, or a protobuf
+  enum number the bindings do not define) now prints `warning: unknown
+  schedule_relationship: ...` and the row is counted as unmatched. Before, JSON input
+  raised an error (exit 2). The v0.1 test asserting that error now asserts the warning.
+  Unknown protobuf enum numbers used to be read silently as `SCHEDULED`; they are now
+  detected through the message's unknown fields (needs protobuf ≥ 4.25; with older
+  protobuf they are still read as `SCHEDULED`).
+- The CLI summary line also prints the replaced-trip count. `report.html` has a
+  "Replaced trips" tile.
+
+### Added
+- Metrics `replaced_trips`, `duplicated_trips` and `new_trips` (overall and per route;
+  the last two are subsets of `added_trips`). Inputs
+  `observations_unknown_relationship` and `replacements_for_unscheduled_trips`.
+- JSON observations accept `REPLACEMENT`, `DUPLICATED` and `NEW`.
+- `realtime.UnknownRelationshipWarning`.
+- `examples/REAL_FEED_VALIDATION.md`: an end-to-end run on the Big Blue Bus (Santa
+  Monica) GTFS feed, with measured timings and counts, and a check of its live
+  GTFS-Realtime snapshot.
+  `examples/big-blue-bus/`: the observation generator, `metrics.json` and `report.html`.
+- 8 tests in `tests/test_trip_relationships.py` (protobuf round-trip for each
+  relationship, unknown enum on the wire, JSON, and a CLI run fed only such trips) and a
+  bulk-load round-trip test in `tests/test_realtime.py`.
+
 ## 0.2.0 - 2026-10-27
 
 ### Added

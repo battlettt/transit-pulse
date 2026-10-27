@@ -5,7 +5,9 @@ from google.transit import gtfs_realtime_pb2 as rt
 
 from transit_pulse.realtime import (
     RealtimeError,
+    UnknownRelationshipWarning,
     parse_feed_message,
+    load_observations,
     parse_json_observations,
     read_observation_file,
 )
@@ -87,8 +89,10 @@ def test_json_validation_errors():
         parse_json_observations([{"stop_id": "S1", "observed_epoch": 1}])
     with pytest.raises(RealtimeError, match="no observed_epoch"):
         parse_json_observations([{"trip_id": "T1a", "stop_sequence": 1}])
-    with pytest.raises(RealtimeError, match="unknown schedule_relationship"):
-        parse_json_observations([{"trip_id": "T1a", "schedule_relationship": "LATE"}])
+    # Since 0.3.0 an unknown value warns and is kept as UNKNOWN (counted unmatched).
+    with pytest.warns(UnknownRelationshipWarning, match="unknown schedule_relationship"):
+        rows = parse_json_observations([{"trip_id": "T1a", "schedule_relationship": "LATE"}])
+    assert rows[0]["schedule_relationship"] == "UNKNOWN"
 
 
 def test_garbage_file_rejected(tmp_path):
@@ -126,3 +130,24 @@ def test_json_start_time_validation():
     assert rows[0]["start_time"] == "25:05:00"
     with pytest.raises(RealtimeError, match="invalid start_time"):
         parse_json_observations([{"trip_id": "F1", "observed_epoch": 1, "start_time": "7am"}])
+
+
+def test_load_observations_bulk_round_trip():
+    """The CSV bulk load keeps awkward strings intact and NULL distinct from ''."""
+    import duckdb
+
+    con = duckdb.connect()
+    rows = parse_json_observations([
+        {"trip_id": 'a,"b"\nc', "stop_id": "S1", "stop_sequence": 3, "observed_epoch": 7,
+         "feed_timestamp": 5, "start_time": "8:00:00"},
+        {"trip_id": "ü", "schedule_relationship": "CANCELED"},
+    ])
+    rows[0]["route_id"] = ""
+    assert load_observations(con, rows) == 2
+    got = con.execute("SELECT * FROM observations ORDER BY trip_id").fetchall()
+    assert got == [
+        ('a,"b"\nc', "", "S1", 3, 7, "SCHEDULED", None, 5, "json", "08:00:00"),
+        ("ü", None, None, None, None, "CANCELED", None, None, "json", None),
+    ]
+    assert load_observations(con, []) == 0
+    assert con.execute("SELECT count(*) FROM observations").fetchone() == (0,)

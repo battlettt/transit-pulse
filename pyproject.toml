@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "transit-pulse"
-version = "0.2.0"
+version = "0.3.0"
 description = "Measure public transit reliability (on-time performance, headway adherence, bunching) from GTFS + GTFS-Realtime."
 readme = "README.md"
 license = { text = "MIT" }

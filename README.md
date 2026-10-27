@@ -7,9 +7,10 @@ on-time performance, headway adherence and bus bunching per route. The numbers g
 `metrics.json`, per-event rows go to `events.csv`, and it builds a self-contained HTML
 dashboard.
 
-**New in 0.2.0** (see [CHANGELOG.md](CHANGELOG.md)): `frequencies.txt` trips, interpolation
-of blank stop times, counting of unscheduled `ADDED` trips, `events.csv`, and GitHub
-Actions CI.
+**New in 0.3.0** (see [CHANGELOG.md](CHANGELOG.md)): GTFS-RT `REPLACEMENT`, `DUPLICATED`
+and `NEW` trips are handled instead of aborting the run, and unknown relationship values
+produce a warning. Observation loading is about 200× faster. The pipeline has been
+validated end to end on a real agency feed (see [Real-feed validation](#real-feed-validation)).
 
 ## Why it matters
 
@@ -62,8 +63,10 @@ sched_epoch, interpolated, observed_epoch, delay_secs, status`.
   ```
   Optional keys are `start_date` (`YYYYMMDD`), `start_time` (`HH:MM:SS`, used to pick
   the instance of a frequency-based trip) and `feed_timestamp`.
-  `schedule_relationship` can be `SCHEDULED`, `ADDED`, `SKIPPED`, or `CANCELED`
-  (a whole trip; `CANCELLED` is also accepted).
+  `schedule_relationship` can be `SCHEDULED`, `ADDED`, `SKIPPED`, `CANCELED`
+  (a whole trip; `CANCELLED` is also accepted), `REPLACEMENT`, `DUPLICATED` or `NEW`
+  (see "Trip relationships" below). Any other value prints a warning, and the record is
+  counted in `inputs.observations_unmatched`. It is not an error.
 - `--date` is the GTFS *service date*. If you omit it, the tool uses the most common
   `start_date` in the realtime data. If no `start_date` is present, it uses the local date
   of the median observation.
@@ -113,7 +116,9 @@ sched_epoch, interpolated, observed_epoch, delay_secs, status`.
    *after* the feed header timestamp are predictions, so they are dropped. A
    VehiclePosition counts only when its status is `STOPPED_AT`. TripDescriptor
    `CANCELED` (or `DELETED`) marks a cancelled trip, and StopTimeUpdate `SKIPPED` marks a
-   skipped stop.
+   skipped stop. A TripDescriptor enum number that the bindings do not know (it would
+   otherwise parse silently as `SCHEDULED`) is detected, warned about, and counted as
+   unmatched.
 3. **Matching** (`analysis.py`): observations are joined to scheduled events on
    `trip_id + stop_sequence`. When the observation has no sequence, or its sequence is
    not in the schedule, the join falls back to `trip_id + stop_id` and picks the nearest
@@ -137,6 +142,26 @@ sched_epoch, interpolated, observed_epoch, delay_secs, status`.
    `overall.added_trips` and `routes[].added_trips` hold the same counts. An `ADDED` trip
    whose `trip_id` *does* exist in the schedule is matched like a scheduled trip. Stops
    marked `SKIPPED` on scheduled trips are still counted as `skipped_events`.
+5. **Trip relationships from GTFS-RT 2.x** (new in 0.3.0; before this, a protobuf feed
+   containing any of them aborted with `unknown schedule_relationship`).
+   - `REPLACEMENT`: the realtime trip replaces the scheduled trip with the same
+     `trip_id` (and `start_time`, for frequency instances). Its stop updates are matched
+     and scored exactly like `SCHEDULED` ones (delay, OTP, skipped stops). The scheduled
+     trip is counted in `replaced_trips` (overall and per route). A replacement whose
+     `trip_id` is not in the schedule is unmatched and counted in
+     `inputs.replacements_for_unscheduled_trips`.
+   - `DUPLICATED`: a copy of a scheduled trip running at another time. It is never
+     matched to the original trip, so it cannot give the original a false delay or skip.
+     It goes to `added_trips` and is also counted in `duplicated_trips`. When the feed
+     gives `trip_properties.trip_id` / `start_date` / `start_time`, those identify the
+     copy. Otherwise it is listed as `trip_id@start_time`. Its `SKIPPED` stop updates are
+     ignored.
+   - `NEW`: a trip unrelated to the schedule. It goes to `added_trips` and is also
+     counted in `new_trips`, whatever its `trip_id` is.
+   - Anything else (JSON values like `"LATE"`, or an undefined protobuf enum number): a
+     `warning: unknown schedule_relationship: ...` on stderr. The rows are counted in
+     `inputs.observations_unmatched` and `inputs.observations_unknown_relationship`,
+     and the run continues (exit 0).
 
 ## Metric definitions
 
@@ -153,15 +178,18 @@ sched_epoch, interpolated, observed_epoch, delay_secs, status`.
 | `skipped_events` | stops marked SKIPPED |
 | `scheduled_trips` | distinct trip instances (each run of a frequency-based trip counts once) |
 | `interpolated_events` | scheduled events whose time was estimated by interpolation |
-| `added_trips` | realtime `ADDED` trips with no scheduled trip, see above. Not part of OTP |
+| `added_trips` | realtime `ADDED` trips with no scheduled trip, plus all `DUPLICATED` and `NEW` trips, see above. Not part of OTP |
+| `duplicated_trips` / `new_trips` | the `DUPLICATED` / `NEW` part of `added_trips` |
+| `replaced_trips` | scheduled trip instances that a realtime `REPLACEMENT` trip stood in for. Their events are scored normally |
 | `headway_deviation_cv` | at high-frequency stops (median scheduled headway ≤ 15 min): stddev(observed headway − scheduled headway) ÷ mean scheduled headway. This is the TCQSM headway-adherence measure. 0 means perfectly regular service |
 | `mean_abs_headway_deviation_secs` | mean \|observed − scheduled headway\| at those stops |
 | bunching event | two consecutive trips of the same route and direction observed at the same stop ≤ 120 s apart, when their scheduled times were ≥ 300 s apart |
 | `delay_histogram` | count of observed events per 1-minute delay bin from −5 to +15 min. The outer bins collect everything beyond that range |
 
 Metrics are reported for all routes together (`overall`) and for each route (`routes`).
-`inputs` reports unmatched observations, observations belonging to added trips, and
-cancellations for trips that are not in the schedule. `schedule` describes how the
+`inputs` reports unmatched observations, observations belonging to added trips,
+cancellations and replacements for trips that are not in the schedule, and observations
+with an unknown relationship. `schedule` describes how the
 schedule was built: interpolated events, frequency events by type, frequency trip
 instances, dropped untimed stop times, and trips without timed stops.
 
@@ -187,15 +215,50 @@ instances, dropped untimed stop times, and trips without timed stops.
 - **Headway-based frequency trips have no true schedule.** Their delays are measured
   against a nominal start grid (see above). OTP for those routes means less than for
   timetabled ones.
-- **ADDED trips are counted, not evaluated.** They have no schedule, so they contribute
-  no delay, OTP or headway figures. Their `SKIPPED` stop updates are not counted, and
-  stop-level ADDED/NEW stops on scheduled trips are not modelled.
-- **Still not supported in 0.2.0:** interpolation using `shape_dist_traveled`;
+- **ADDED, DUPLICATED and NEW trips are counted, not evaluated.** They have no schedule
+  of their own, so they contribute no delay, OTP or headway figures. Their `SKIPPED` stop
+  updates are not counted, and stop-level ADDED/NEW stops on scheduled trips are not
+  modelled. A `DUPLICATED` trip uses `trip_properties` only for its id, date and start
+  time. Its times are not compared with the shifted schedule of the copied trip.
+- **REPLACEMENT is scored against the original timetable.** A replacement's stop updates
+  are compared with the replaced trip's scheduled times. Stops that the replacement
+  leaves out are `unobserved`, not removed from the schedule, and a replacement's new
+  shape or stop pattern (`trip_properties.shape_id`, stop-level changes) is not modelled.
+- **Real-feed validation used synthetic delays.** A real schedule was run end to end,
+  but the agency's no-key realtime feed was stale and used ids that do not match its
+  static feed. No real performance numbers have been produced yet (see
+  [examples/REAL_FEED_VALIDATION.md](examples/REAL_FEED_VALIDATION.md)).
+- **Still not supported in 0.3.0:** interpolation using `shape_dist_traveled`;
   `frequencies.txt` without a realtime `start_time` cannot tell apart two instances that
-  are close in time; GTFS-RT `REPLACEMENT`/`DUPLICATED`/`NEW` trips (a protobuf feed that contains
-  one currently fails with `unknown schedule_relationship`) and `trip_properties`;
-  `block_id`/vehicle-level analysis; passenger-weighted metrics; multi-day runs (one
-  service date per run). Performance on very large feeds is still untested.
+  are close in time; most of `trip_properties` (see above); `block_id`/vehicle-level
+  analysis; passenger-weighted metrics; multi-day runs (one service date per run).
+  Measured performance covers one mid-size agency (58,287 stop events and 16,530
+  observations in about 1.2 s). Feeds an order of magnitude larger, or multi-million-row
+  snapshot archives, have not been timed.
+
+## Real-feed validation
+
+transit-pulse 0.3.0 was run end to end on **Big Blue Bus** (Santa Monica) data on
+2026-10-27. The keyless feeds were found through the
+[Mobility Database catalog](https://github.com/MobilityData/mobility-database-catalogs).
+
+- Static feed (<http://gtfs.bigbluebus.com/current.zip>): 17 routes, 3,277 trips and
+  123,699 stop times. That gives 58,287 scheduled stop events for 2026-10-27, loaded and
+  built in about 0.5 s.
+- A deterministic, schedule-derived observation set
+  ([`examples/big-blue-bus/derive_observations.py`](examples/big-blue-bus/derive_observations.py))
+  went through the real CLI. It has 16,530 records, with early and late running,
+  cancellations, skipped stops, AVL gaps, and REPLACEMENT/DUPLICATED/NEW trips. The
+  outputs are in [`examples/big-blue-bus/report.html`](examples/big-blue-bus/report.html)
+  and [`examples/big-blue-bus/metrics.json`](examples/big-blue-bus/metrics.json). The
+  delays are **synthetic**, so these are not Big Blue Bus's real numbers.
+- The agency's live TripUpdates snapshot parsed without a crash: 35 past stop updates
+  kept and 1,256 predictions dropped. However, the snapshot was 19 days stale, and none
+  of its 50 trip ids exist in the current static feed.
+
+Full method, commands and measured numbers are in
+[examples/REAL_FEED_VALIDATION.md](examples/REAL_FEED_VALIDATION.md). That run is also
+where a 17.7 s observation-loading bottleneck was found and fixed.
 
 ## Development
 
@@ -207,6 +270,7 @@ src/transit_pulse/
   report.py        metrics.json + report.html (inline SVG) + events.csv
   cli.py           argparse entry point
 tests/             pytest suite with an in-test synthetic GTFS builder (tests/conftest.py)
+examples/          real-feed validation write-up and the Big Blue Bus example run
 .github/workflows/ci.yml   pytest on push / pull_request, Python 3.11 and 3.12
 ```
 

@@ -183,6 +183,7 @@ def render_html(metrics: dict) -> str:
         ("Median |delay|", _fmt(o.get("median_abs_delay_secs"), " s")),
         ("Cancelled trips", _fmt(o.get("cancelled_trips"))),
         ("Bunching events", _fmt(o.get("bunching_events"))),
+        ("Replaced trips", _fmt(o.get("replaced_trips"))),
         ("Added (unscheduled) trips", _fmt(o.get("added_trips"))),
     ]
     tiles_html = "".join(
