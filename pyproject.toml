@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transit-pulse"
+version = "0.1.0"
+description = "Measure public transit reliability (on-time performance, headway adherence, bunching) from GTFS + GTFS-Realtime."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb",
+    "gtfs-realtime-bindings",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+transit-pulse = "transit_pulse.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
