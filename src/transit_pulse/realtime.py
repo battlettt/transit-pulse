@@ -3,7 +3,10 @@
 Every input becomes rows of the `observations` table:
 
     trip_id, route_id, stop_id, stop_sequence, observed_epoch,
-    schedule_relationship, start_date, feed_timestamp, source
+    schedule_relationship, start_date, feed_timestamp, source, start_time
+
+start_time is the TripDescriptor start_time ("HH:MM:SS", may exceed 24:00:00). It is
+only used to pick the right instance of a frequency-based trip.
 
 schedule_relationship is one of SCHEDULED, ADDED, SKIPPED (one stop not served) or
 CANCELED (whole trip; stop_id/stop_sequence/observed_epoch are NULL).
@@ -27,6 +30,7 @@ COLUMNS = [
     "start_date",
     "feed_timestamp",
     "source",
+    "start_time",
 ]
 
 # Spellings seen in the wild, mapped to one canonical value.
@@ -64,7 +68,7 @@ def normalize_relationship(value) -> str:
 
 def parse_json_observations(records, source: str = "json") -> list[dict]:
     """Accept a list of {trip_id, route_id, stop_id, stop_sequence, observed_epoch,
-    schedule_relationship[, start_date]} dicts (or {"observations": [...]})."""
+    schedule_relationship[, start_date, start_time]} dicts (or {"observations": [...]})."""
     if isinstance(records, dict):
         records = records.get("observations")
     if not isinstance(records, list):
@@ -89,9 +93,22 @@ def parse_json_observations(records, source: str = "json") -> list[dict]:
                 start_date=_str_or_none(rec.get("start_date")),
                 feed_timestamp=rec.get("feed_timestamp"),
                 source=source,
+                start_time=normalize_start_time(rec.get("start_time")),
             )
         )
     return rows
+
+
+def normalize_start_time(value) -> str | None:
+    """'8:00:00' -> '08:00:00'; blank -> None. Raises RealtimeError if malformed."""
+    if value in (None, ""):
+        return None
+    parts = str(value).strip().split(":")
+    try:
+        h, m, sec = (int(x) for x in parts)
+    except ValueError:
+        raise RealtimeError(f"invalid start_time: {value!r} (expected HH:MM:SS)") from None
+    return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
 def _str_or_none(value):
@@ -124,7 +141,16 @@ def _trip_fields(trip: rt.TripDescriptor) -> dict:
         "trip_id": trip.trip_id,
         "route_id": trip.route_id or None,
         "start_date": trip.start_date or None,
+        "start_time": _lenient_start_time(trip.start_time),
     }
+
+
+def _lenient_start_time(value) -> str | None:
+    """Protobuf feeds: a malformed start_time is ignored rather than failing the run."""
+    try:
+        return normalize_start_time(value)
+    except RealtimeError:
+        return None
 
 
 def _trip_update_rows(tu: rt.TripUpdate, header_ts) -> list[dict]:
@@ -222,7 +248,7 @@ def load_observations(con, rows: list[dict]) -> int:
         CREATE TABLE observations (
             trip_id VARCHAR, route_id VARCHAR, stop_id VARCHAR, stop_sequence INTEGER,
             observed_epoch BIGINT, schedule_relationship VARCHAR, start_date VARCHAR,
-            feed_timestamp BIGINT, source VARCHAR
+            feed_timestamp BIGINT, source VARCHAR, start_time VARCHAR
         )
         """
     )

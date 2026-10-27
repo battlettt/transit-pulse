@@ -122,19 +122,45 @@ def gtfs_zip(tmp_path):
     return write_gtfs_zip(tmp_path / "gtfs.zip")
 
 
+def run_analysis(zip_path, records, service_date=SERVICE_DATE, thresholds=None):
+    """Full pipeline on one GTFS zip and a list of observation dicts -> (metrics, con)."""
+    con = duckdb.connect()
+    load_gtfs(con, zip_path)
+    load_observations(con, parse_json_observations(records))
+    build_scheduled_events(con, service_date)
+    metrics = compute_metrics(con, service_date, thresholds or Thresholds())
+    return metrics, con
+
+
 @pytest.fixture
 def analyze(gtfs_zip):
     """analyze(observation_dicts, date=SERVICE_DATE, thresholds=None) -> (metrics, con)"""
 
     def _run(records, service_date=SERVICE_DATE, thresholds=None):
-        con = duckdb.connect()
-        load_gtfs(con, gtfs_zip)
-        load_observations(con, parse_json_observations(records))
-        build_scheduled_events(con, service_date)
-        metrics = compute_metrics(con, service_date, thresholds or Thresholds())
-        return metrics, con
+        return run_analysis(gtfs_zip, records, service_date, thresholds)
 
     return _run
+
+
+def stop_time(trip_id, seq, t, stop_id=None, departure=None) -> dict:
+    """One stop_times.txt row; t may be "" for a blank (non-timepoint) time."""
+    return {"trip_id": trip_id, "arrival_time": t,
+            "departure_time": t if departure is None else departure,
+            "stop_id": stop_id or f"S{(seq - 1) % 3 + 1}", "stop_sequence": str(seq)}
+
+
+def feed_with(extra_trips=(), extra_stop_times=(), frequencies=None) -> dict:
+    """default_feed() plus extra R1/R2 trips (route_id, trip_id), stop times and an
+    optional frequencies.txt (list of row dicts)."""
+    feed = default_feed()
+    feed["trips.txt"] += [
+        {"route_id": r, "service_id": "WK", "trip_id": t, "direction_id": "0"}
+        for r, t in extra_trips
+    ]
+    feed["stop_times.txt"] += list(extra_stop_times)
+    if frequencies:
+        feed["frequencies.txt"] = frequencies
+    return feed
 
 
 def route(metrics: dict, route_id: str) -> dict:

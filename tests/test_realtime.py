@@ -96,3 +96,33 @@ def test_garbage_file_rejected(tmp_path):
     bad.write_bytes(b"\xff\xff\xff not protobuf")
     with pytest.raises(RealtimeError):
         read_observation_file(str(bad))
+
+
+def test_protobuf_added_trip_and_start_time():
+    feed = rt.FeedMessage()
+    feed.header.gtfs_realtime_version = "2.0"
+    feed.header.timestamp = HEADER_TS
+    e = feed.entity.add(id="added")
+    e.trip_update.trip.trip_id = "X1"
+    e.trip_update.trip.route_id = "R1"
+    e.trip_update.trip.start_time = "7:15:00"
+    e.trip_update.trip.schedule_relationship = rt.TripDescriptor.ADDED
+    stu = e.trip_update.stop_time_update.add(stop_sequence=1, stop_id="S1")
+    stu.arrival.time = HEADER_TS - 60
+    e = feed.entity.add(id="bad_start")
+    e.trip_update.trip.trip_id = "T1a"
+    e.trip_update.trip.start_time = "soon"  # malformed: ignored, not fatal
+    stu = e.trip_update.stop_time_update.add(stop_sequence=1, stop_id="S1")
+    stu.arrival.time = HEADER_TS - 60
+    added, other = parse_feed_message(feed)
+    assert added["schedule_relationship"] == "ADDED"
+    assert (added["route_id"], added["start_time"]) == ("R1", "07:15:00")
+    assert other["start_time"] is None
+
+
+def test_json_start_time_validation():
+    rows = parse_json_observations([{"trip_id": "F1", "stop_sequence": 1, "observed_epoch": 1,
+                                     "start_time": "25:05:00"}])
+    assert rows[0]["start_time"] == "25:05:00"
+    with pytest.raises(RealtimeError, match="invalid start_time"):
+        parse_json_observations([{"trip_id": "F1", "observed_epoch": 1, "start_time": "7am"}])

@@ -10,6 +10,8 @@ import datetime as dt
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
+from .gtfs_static import schedule_summary
+
 # An observation more than this far from its scheduled time is treated as unmatched,
 # so the same trip_id on an adjacent service day cannot produce a ~24h "delay".
 MAX_MATCH_WINDOW_SECS = 4 * 3600
@@ -48,6 +50,8 @@ def build_events(con, service_date: dt.date, thresholds: Thresholds) -> None:
     )
     # Candidate matches: trip_id + stop_sequence first; trip_id + stop_id as fallback
     # when the observation has no sequence or its sequence is not in the schedule.
+    # Frequency-based trips share one trip_id across instances: a realtime start_time
+    # selects the instance exactly, otherwise the nearest instance in time wins.
     con.execute(
         """
         CREATE OR REPLACE TEMP TABLE obs_match AS
@@ -57,15 +61,19 @@ def build_events(con, service_date: dt.date, thresholds: Thresholds) -> None:
             FROM obs o
             JOIN scheduled_events e
               ON o.trip_id = e.trip_id AND o.stop_sequence = e.stop_sequence
+             AND (o.start_time IS NULL OR e.frequency_start_time IS NULL
+                   OR o.start_time = e.frequency_start_time)
             UNION ALL
             SELECT o.obs_id, e.event_id, 2 AS match_rank,
                    abs(o.observed_epoch - e.sched_epoch) AS distance
             FROM obs o
             JOIN scheduled_events e ON o.trip_id = e.trip_id AND o.stop_id = e.stop_id
-            WHERE o.stop_sequence IS NULL
+             AND (o.start_time IS NULL OR e.frequency_start_time IS NULL
+                   OR o.start_time = e.frequency_start_time)
+            WHERE (o.stop_sequence IS NULL
                OR NOT EXISTS (SELECT 1 FROM scheduled_events s
                               WHERE s.trip_id = o.trip_id
-                                AND s.stop_sequence = o.stop_sequence)
+                                AND s.stop_sequence = o.stop_sequence))
         )
         SELECT obs_id, event_id, match_rank FROM candidates
         QUALIFY row_number() OVER (PARTITION BY obs_id
@@ -97,23 +105,30 @@ def build_events(con, service_date: dt.date, thresholds: Thresholds) -> None:
     con.execute(
         """
         CREATE OR REPLACE TEMP TABLE cancelled_trips AS
-        SELECT DISTINCT trip_id FROM obs WHERE schedule_relationship = 'CANCELED'
+        SELECT DISTINCT trip_id, start_time FROM obs WHERE schedule_relationship = 'CANCELED'
         """
     )
     con.execute(
         """
         CREATE OR REPLACE TABLE events AS
+        WITH cancelled_events AS (
+            -- A start_time on the cancellation narrows it to one frequency instance.
+            SELECT DISTINCT e.event_id FROM scheduled_events e
+            JOIN cancelled_trips c ON c.trip_id = e.trip_id
+             AND (c.start_time IS NULL OR e.frequency_start_time IS NULL
+                  OR c.start_time = e.frequency_start_time)
+        )
         SELECT e.*,
                eo.observed_epoch,
                eo.observed_epoch - e.sched_epoch AS delay_secs,
-               e.trip_id IN (SELECT trip_id FROM cancelled_trips) AS trip_cancelled,
+               e.event_id IN (SELECT event_id FROM cancelled_events) AS trip_cancelled,
                CASE
                    -- An actual observation wins: the vehicle demonstrably served the stop.
                    WHEN eo.observed_epoch IS NOT NULL THEN
                        CASE WHEN eo.observed_epoch - e.sched_epoch < -$early THEN 'early'
                             WHEN eo.observed_epoch - e.sched_epoch > $late THEN 'late'
                             ELSE 'on_time' END
-                   WHEN e.trip_id IN (SELECT trip_id FROM cancelled_trips) THEN 'cancelled'
+                   WHEN e.event_id IN (SELECT event_id FROM cancelled_events) THEN 'cancelled'
                    WHEN e.event_id IN (SELECT event_id FROM event_skipped) THEN 'skipped'
                    ELSE 'unobserved'
                END AS status
@@ -144,8 +159,8 @@ def performance_metrics(con) -> tuple[dict, list[dict]]:
             route_id,
             GROUPING(route_id) = 1 AS is_overall,
             count(*) AS scheduled_events,
-            count(DISTINCT trip_id) AS scheduled_trips,
-            count(DISTINCT trip_id) FILTER (WHERE trip_cancelled) AS cancelled_trips,
+            count(DISTINCT trip_instance_id) AS scheduled_trips,
+            count(DISTINCT trip_instance_id) FILTER (WHERE trip_cancelled) AS cancelled_trips,
             count(*) FILTER (WHERE status = 'cancelled') AS cancelled_events,
             count(*) FILTER (WHERE status = 'skipped') AS skipped_events,
             count(*) FILTER (WHERE status = 'unobserved') AS unobserved_events,
@@ -153,6 +168,7 @@ def performance_metrics(con) -> tuple[dict, list[dict]]:
             count(*) FILTER (WHERE status = 'early') AS early_events,
             count(*) FILTER (WHERE status = 'on_time') AS on_time_events,
             count(*) FILTER (WHERE status = 'late') AS late_events,
+            count(*) FILTER (WHERE interpolated) AS interpolated_events,
             100.0 * count(*) FILTER (WHERE status = 'on_time')
                 / nullif(count(*) FILTER (WHERE delay_secs IS NOT NULL), 0) AS otp_pct,
             100.0 * count(*) FILTER (WHERE delay_secs IS NOT NULL)
@@ -184,7 +200,7 @@ def _observed_pairs_sql() -> str:
     observed time, with the scheduled gap between those same two trips."""
     return """
         SELECT route_id, direction_id, stop_id,
-               lag(trip_id) OVER w AS prev_trip_id, trip_id,
+               lag(trip_instance_id) OVER w AS prev_trip_id, trip_instance_id AS trip_id,
                observed_epoch - lag(observed_epoch) OVER w AS observed_headway,
                sched_epoch - lag(sched_epoch) OVER w AS scheduled_headway
         FROM events
@@ -292,15 +308,57 @@ def input_summary(con) -> dict:
             (SELECT count(*) FROM obs) AS observations_for_service_date,
             (SELECT count(*) FROM obs
              WHERE schedule_relationship IN ('SCHEDULED', 'ADDED')
-               AND obs_id NOT IN (SELECT obs_id FROM obs_match)) AS observations_unmatched,
+               AND obs_id NOT IN (SELECT obs_id FROM obs_match)
+               AND obs_id NOT IN (SELECT obs_id FROM added_obs)) AS observations_unmatched,
+            (SELECT count(*) FROM added_obs) AS observations_added_trips,
             (SELECT count(*) FROM cancelled_trips
              WHERE trip_id NOT IN (SELECT trip_id FROM scheduled_events))
                 AS cancellations_for_unscheduled_trips
         """
     ).fetchone()
     names = ["observations_total", "observations_for_service_date",
-             "observations_unmatched", "cancellations_for_unscheduled_trips"]
+             "observations_unmatched", "observations_added_trips",
+             "cancellations_for_unscheduled_trips"]
     return dict(zip(names, row))
+
+
+def added_trips(con, names: dict[str, str]) -> dict:
+    """Realtime trips marked ADDED whose trip_id is not in the schedule for this date.
+
+    They have no scheduled times, so they cannot have a delay or count toward OTP; they
+    are counted here instead of being dropped. Route comes from the realtime
+    TripDescriptor (null when the feed omits it).
+    """
+    con.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE added_obs AS
+        SELECT * FROM obs
+        WHERE schedule_relationship = 'ADDED'
+          AND trip_id NOT IN (SELECT trip_id FROM scheduled_events)
+        """
+    )
+    rows = con.execute(
+        """
+        WITH trips AS (
+            SELECT trip_id, max(route_id) AS route_id,
+                   count(*) FILTER (WHERE observed_epoch IS NOT NULL) AS observations
+            FROM added_obs GROUP BY trip_id
+        )
+        SELECT route_id, count(*) AS trips, sum(observations)::BIGINT AS observations,
+               list(trip_id ORDER BY trip_id) AS trip_ids
+        FROM trips GROUP BY route_id ORDER BY route_id NULLS LAST
+        """
+    ).fetchall()
+    routes = [
+        {"route_id": r, "route_name": names.get(r, r) if r else None, "trips": n,
+         "observations": o, "trip_ids": list(ids)}
+        for r, n, o, ids in rows
+    ]
+    return {
+        "count": sum(r["trips"] for r in routes),
+        "observations": sum(r["observations"] for r in routes),
+        "routes": routes,
+    }
 
 
 def route_names(con) -> dict[str, str]:
@@ -336,6 +394,8 @@ def compute_metrics(con, service_date: dt.date, thresholds: Thresholds | None = 
     headways = headway_metrics(con)
     bunching = bunching_events(con)
     names = route_names(con)
+    added = added_trips(con, names)
+    added_by_route = {r["route_id"]: r["trips"] for r in added["routes"]}
 
     empty_headway = {
         "headway_pairs": 0,
@@ -346,10 +406,12 @@ def compute_metrics(con, service_date: dt.date, thresholds: Thresholds | None = 
     }
     overall.update(headways.get(None, empty_headway))
     overall["bunching_events"] = len(bunching)
+    overall["added_trips"] = added["count"]
     for route in routes:
         route["route_name"] = names.get(route["route_id"], route["route_id"])
         route.update(headways.get(route["route_id"], empty_headway))
         route["bunching_events"] = sum(1 for b in bunching if b["route_id"] == route["route_id"])
+        route["added_trips"] = added_by_route.get(route["route_id"], 0)
 
     return {
         "service_date": service_date.isoformat(),
@@ -358,5 +420,7 @@ def compute_metrics(con, service_date: dt.date, thresholds: Thresholds | None = 
         "routes": routes,
         "bunching": bunching,
         "delay_histogram": delay_histogram(con),
+        "added_trips": added,
+        "schedule": schedule_summary(con),
         "inputs": input_summary(con),
     }

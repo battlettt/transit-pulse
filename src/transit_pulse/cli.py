@@ -12,7 +12,7 @@ from . import __version__
 from .analysis import Thresholds, compute_metrics, infer_service_date
 from .gtfs_static import GTFSError, agency_timezone, build_scheduled_events, load_gtfs
 from .realtime import RealtimeError, load_observation_files
-from .report import write_report
+from .report import write_events_csv, write_report
 
 
 def _date(value: str) -> dt.date:
@@ -43,7 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--realtime", required=True, nargs="+",
         help="GTFS-Realtime .pb file(s) and/or normalized .json observation file(s)",
     )
-    analyze.add_argument("--out-dir", required=True, help="directory for metrics.json + report.html")
+    analyze.add_argument("--out-dir", required=True,
+                         help="directory for metrics.json, report.html and events.csv")
     analyze.add_argument(
         "--date", type=_date,
         help="service date YYYY-MM-DD (default: inferred from the realtime data)",
@@ -69,14 +70,23 @@ def run_analyze(args) -> int:
         print(f"warning: no scheduled service on {service_date}", file=sys.stderr)
     metrics = compute_metrics(con, service_date, Thresholds(args.early_secs, args.late_secs))
     json_path, html_path = write_report(metrics, args.out_dir)
+    csv_path = write_events_csv(con, args.out_dir)
+
+    untimed = metrics["schedule"]["trips_without_timed_stops"]
+    if untimed["count"]:
+        shown = ", ".join(untimed["trip_ids"][:5]) + (", ..." if untimed["count"] > 5 else "")
+        print(f"warning: {untimed['count']} trips have no timed stops and were left out of "
+              f"the schedule: {shown}", file=sys.stderr)
 
     o = metrics["overall"]
     otp = "n/a" if o["otp_pct"] is None else f"{o['otp_pct']:.1f}%"
     print(f"service date {service_date}: OTP {otp} over {o['observed_events']} observed "
           f"of {o['scheduled_events']} scheduled stop events; "
-          f"{o['cancelled_trips']} cancelled trips; {o['bunching_events']} bunching events")
+          f"{o['cancelled_trips']} cancelled trips; {o['added_trips']} added trips; "
+          f"{o['bunching_events']} bunching events")
     print(f"wrote {json_path}")
     print(f"wrote {html_path}")
+    print(f"wrote {csv_path}")
     return 0
 
 

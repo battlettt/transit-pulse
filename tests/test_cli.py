@@ -82,3 +82,42 @@ def test_console_script_installed():
     assert exe.exists() or shutil.which("transit-pulse")
     result = subprocess.run([str(exe), "--version"], capture_output=True, text=True)
     assert result.returncode == 0 and "transit-pulse" in result.stdout
+
+
+def test_cli_v2_outputs_added_trips_events_csv_and_untimed_warning(tmp_path, capsys):
+    import csv
+
+    from conftest import feed_with, stop_time, write_gtfs_zip
+
+    feed = feed_with(
+        [("R1", "I1"), ("R2", "U1")],
+        [stop_time("I1", 1, "10:00:00"), stop_time("I1", 2, ""), stop_time("I1", 3, "10:10:00"),
+         stop_time("U1", 1, ""), stop_time("U1", 2, "")],
+    )
+    gtfs = write_gtfs_zip(tmp_path / "v2.zip", feed)
+    js = tmp_path / "obs.json"
+    js.write_text(json.dumps([
+        obs("I1", 2, "10:05:00", delay=20),
+        {"trip_id": "X1", "route_id": "R2", "stop_id": "S1", "stop_sequence": 1,
+         "observed_epoch": sched_epoch("09:00:00"), "schedule_relationship": "ADDED"},
+    ]))
+    out = tmp_path / "out"
+    assert main(["analyze", "--static", gtfs, "--realtime", str(js), "--out-dir", str(out),
+                 "--date", "2024-03-06"]) == 0
+    captured = capsys.readouterr()
+    assert "1 added trips" in captured.out
+    assert "warning: 1 trips have no timed stops" in captured.err and "U1" in captured.err
+
+    metrics = json.loads((out / "metrics.json").read_text())
+    assert metrics["added_trips"]["count"] == 1
+    assert metrics["added_trips"]["routes"][0]["route_id"] == "R2"
+    assert metrics["schedule"]["interpolated_events"] == 1
+
+    with open(out / "events.csv", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == metrics["overall"]["scheduled_events"] == 18
+    interp = [r for r in rows if r["interpolated"] == "true"]
+    assert [(r["trip_id"], r["stop_sequence"], r["delay_secs"], r["status"]) for r in interp] \
+        == [("I1", "2", "20", "on_time")]
+    html = (out / "report.html").read_text()
+    assert "estimated by linear interpolation" in html and "events.csv" in html
